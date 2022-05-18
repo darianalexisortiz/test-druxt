@@ -1,0 +1,154 @@
+<?php
+
+/**
+ * @file
+ * Drupal module hooks and shared functionality.
+ */
+
+use Drupal\Core\Access\AccessResult;
+use Drupal\Core\Entity\Entity\EntityViewDisplay;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\EntityTypeInterface;
+use Drupal\Core\Session\AccountInterface;
+use Drupal\jsonapi\Routing\Routes;
+
+/**
+ * Checks for Druxt route access.
+ */
+function druxt_access_check(AccountInterface $account) {
+  $route = \Drupal::routeMatch()->getRouteObject();
+  if (!$route) {
+    return FALSE;
+  }
+
+  $defaults = $route->getDefaults();
+
+  // Is the route a JSON API request?
+  if (!Routes::isJsonApiRequest($defaults)) {
+    return FALSE;
+  }
+
+  // Is the JSON API resource a Druxt resource?
+  $resources = [
+    'block--block',
+    'configurable_language--configurable_language',
+    'entity_form_display--entity_form_display',
+    'entity_form_mode--entity_form_mode',
+    'entity_view_display--entity_view_display',
+    'entity_view_mode--entity_view_mode',
+    'field_config--field_config',
+    'field_storage_config--field_storage_config',
+    'jsonapi_resource_config--jsonapi_resource_config',
+    'menu--menu',
+    'menu_link_content--menu_link_content',
+    'view--view',
+  ];
+  if (!in_array($defaults['resource_type'], $resources)) {
+    return FALSE;
+  }
+
+  // Is the route a GET request?
+  if (!in_array('GET', $route->getMethods())) {
+    return FALSE;
+  }
+
+  // Does the user have access?
+  if (!$account->hasPermission('access druxt resources')) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Implements hook_entity_access().
+ */
+function druxt_entity_access(EntityInterface $entity, $operation, AccountInterface $account) {
+  return druxt_access_check($account) ? AccessResult::allowed() : AccessResult::neutral();
+}
+
+/**
+ * Implements hook_entity_bundle_create().
+ */
+function druxt_entity_bundle_create($entity_type_id, $bundle) {
+  if (\Drupal::isConfigSyncing()) {
+    return;
+  }
+  druxt_ensure_entity_view_display($entity_type_id, $bundle);
+}
+
+/**
+ * Implements hook_jsonapi_entity_filter_access().
+ */
+function druxt_jsonapi_entity_filter_access(EntityTypeInterface $entity_type, AccountInterface $account) {
+  if (!druxt_access_check($account)) {
+    return;
+  }
+
+  return ([
+    JSONAPI_FILTER_AMONG_ALL => AccessResult::allowed(),
+  ]);
+}
+
+/**
+ * Implments hook_condition_info_alter().
+ */
+function druxt_condition_info_alter(array &$info) {
+  // Use custom 'request_path' plugin to allow setting of the path from DruxtJS
+  // frontend.
+  $info['request_path']['class'] = 'Drupal\druxt\Plugin\Condition\DruxtRequestPath';
+  $info['request_path']['provider'] = 'druxt';
+}
+
+/**
+ * Ensure that all required EntityViewDisplays are available.
+ */
+function druxt_ensure_entity_view_displays() {
+  $bundle_info = \Drupal::service('entity_type.bundle.info');
+  $display_repository = \Drupal::service('entity_display.repository');
+
+  $view_modes = $display_repository->getAllViewModes();
+  $definitions = \Drupal::entityTypeManager()->getDefinitions();
+
+  foreach (array_keys($view_modes) as $entity_type_id) {
+    if (!in_array($entity_type_id, array_keys($definitions))) {
+      continue;
+    }
+
+    $class = \Drupal::entityTypeManager()
+      ->getDefinition($entity_type_id)
+      ->getOriginalClass();
+    if (!($class instanceof FieldableEntityInterface)) {
+      continue;
+    }
+
+    $bundles = $bundle_info->getBundleInfo($entity_type_id);
+    foreach (array_keys($bundles) as $bundle) {
+      $displays = $display_repository->getViewModeOptionsByBundle($entity_type_id, $bundle);
+      if (empty($displays)) {
+        $displays = ['default' => TRUE];
+      }
+      foreach (array_keys($displays) as $mode) {
+        druxt_ensure_entity_view_display($entity_type_id, $bundle, $mode);
+      }
+    }
+  }
+}
+
+/**
+ * Ensure that a specified EntityViewDisplay is present, or create it.
+ */
+function druxt_ensure_entity_view_display($entity_type_id, $bundle, $mode = 'default') {
+  $result = \Drupal::entityQuery('entity_view_display')
+    ->condition('id', "{$entity_type_id}.{$bundle}.{$mode}")
+    ->execute();
+  if (empty($result)) {
+    // Create missing configuration entities.
+    EntityViewDisplay::create([
+      'targetEntityType' => $entity_type_id,
+      'bundle' => $bundle,
+      'mode' => $mode,
+      'status' => TRUE,
+    ])->save();
+  }
+}
